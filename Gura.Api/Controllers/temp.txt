@@ -1,0 +1,358 @@
+﻿using CDS.API.Exceptions;
+using CDS.API.Interfaces.Services;
+using CDS.API.Web.Filters;
+using CDS.API.Web.SwaggerIO.Return_Types;
+using CDS.Fabric.ApiMappers.ApiInterfaces.Mappers;
+using CDS.Fabric.Common;
+using CDS.Fabric.UnitOfWork;
+using CDS.Fabric.Validation;
+using CDS.Model;
+using CDS.Model.Dto;
+using CDS.Model.Dto.Responses;
+using CDS.Resources.Api;
+using Swashbuckle.Swagger.Annotations;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Threading.Tasks;
+using System.Web.Http;
+using System.Web.Http.Description;
+using System.Web.Http.Results;
+using System.Xml.Linq;
+
+namespace CDS.API.Web.Controllers
+{
+    /// <summary>
+    ///
+    /// </summary>
+    [ApiAuthorizationFilter]
+    [ApiActionFilter]
+    [RoutePrefix("{tenantName}/Contact")]
+    [SwaggerResponse(HttpStatusCode.InternalServerError, "Something went horribly wrong!", typeof(ExceptionReturnMessage))]
+    public class ContactController : BaseApiController
+    {
+        private const string DiscoveryLinkName = "Contact";
+        private readonly IContactMapper _mapper;
+        private readonly IImageValidator _imageValidator;
+
+        public ContactController(  ILogService logService, IContactMapper mapper, IImageValidator imageValidator)
+            : base(logService)
+        {
+ 
+            _mapper = mapper;
+            _imageValidator = imageValidator;
+        }
+
+        /// <summary>
+        /// Gets all contacts.
+        /// </summary>
+        /// <param name="tenantName">Name of the tenant.</param>
+        /// <param name="getModel">The get all model.</param>
+        /// <returns></returns>
+        [Route("All", Name = "contacts")]
+        [HttpPost]
+        [ApiExplorerSettings(IgnoreApi = true)]
+        [SwaggerResponse(HttpStatusCode.OK, "A list of contacts (id, name and url for each)", typeof(List<ContactDto>))]
+        public async Task<IHttpActionResult> GetAll(string tenantName, [FromBody]GetAllModel getModel)
+        {
+            var resultList = await GetAll(tenantName, _mapper, getModel, CDS.Model.Definitions.Entities.Contact, GetOrderByExpression(), GetWhereExpression(), DiscoveryLinkName);
+            return ToLongJsonResult(resultList);
+        }
+
+        /// <summary>
+        /// Update an existing, or Create a new contact
+        /// </summary>
+        /// <param name="tenantName">Tenants name</param>
+        /// <param name="entity">The contact record.</param>
+        /// <returns></returns>
+        /// This action tries to create a new contact, if a contact already exists it will try to update it.
+        [HttpPut, Route("", Name = "UpsertContact")]
+        [SwaggerResponse(HttpStatusCode.Created, "A new contact was created using the given information [ see the supplied URL for more data ]", typeof(CreatedReturnMessage))]
+        [SwaggerResponse(HttpStatusCode.NotFound, "The contact was not found in our DB", typeof(ResponseMessageResult))]
+        public async Task<IHttpActionResult> Upsert(string tenantName, [FromBody] ContactDto entity)
+        {
+            var contactUnit = new ContactUnit(AuthUser);
+
+            var uploadImageResult = await UploadImage(_imageValidator, entity);
+            if (uploadImageResult.Status != ResponseStatus.Ok)
+            {
+                return ToErrorResult(uploadImageResult);
+            }
+
+            var contactModel = _mapper.ToModel(entity, AuthUser, true);
+            var primaryEmail = entity.EmailAddresses?.FirstOrDefault(c => c.IsPrimary.IsTrue()) ?? entity.EmailAddresses?.FirstOrDefault();
+            var contatByEmail = primaryEmail != null ? contactUnit.GetByEmail(primaryEmail.Email, "id".ToSingleMemberList()) : null;
+
+            try
+            {
+                if (contatByEmail == null)
+                {
+                    entity.Id = contactUnit.Create(contactModel, Contact.eCreateType.Api);
+                }
+                else
+                {
+                    contactModel.Id = contatByEmail.Id;
+                    contactUnit.Update(contactModel);
+                    entity.Id = contactModel.Id;
+                }
+            }
+            catch (ValidationException e)
+            {
+                return BadRequest(string.Join(",", e.ErrorMessages));
+            }
+            catch (Exception e)
+            {
+                throw new InternalServerErrorException("Error while trying to create a contact " + e.Message,
+                    User.UserId, User.TenantId);
+            }
+
+
+            return Created(CreateDiscoveryLink(DiscoveryLinkName, new { tenantName, id = entity.Id }), new ServiceResponse<int> { Status = ResponseStatus.Ok, Result = entity.Id, ImageUrl = entity.ImageUrl });
+        }
+
+        /// <summary>
+        /// Get A single Contact
+        /// </summary>
+        /// <param name="tenantName">Tenant Name from the Routing parameter</param>
+        /// <param name="id">Contact ID</param>
+        /// <param name="fields">optional. list of required fields for the contact DTO. fields that do not have a value will not be returned, unless the showEmptyFields parameter is set to true.</param>
+        /// <param name="showEmptyFields">determines if all the requested fields will be returned or only the non-empty.</param>
+        /// <param name="withDiscovery">specify whether to return the discovery URL</param>
+        /// <returns></returns>
+        [Route("{id}", Name = "Contact")]
+        [HttpGet]
+        [SwaggerResponse(HttpStatusCode.OK, "A full contact model", typeof(ContactDto))]
+        [SwaggerResponse(HttpStatusCode.NotFound, "The contact was not found in our DB", typeof(ResponseMessageResult))]
+        public async Task<IHttpActionResult> Get(string tenantName, int id, [FromUri] string[] fields = null, bool withDiscovery = true, bool showEmptyFields = false)
+        {
+            if (fields != null && fields.Length > 0)
+            {
+                showEmptyFields = true;
+            }
+            var contact = new ContactUnit(AuthUser).GetFull(id);
+
+            if (contact == null)
+            {
+                return NotFound(CDS.Model.Definitions.Entities.Contact.ToString());
+            }
+
+            var dto = await MapToDto(_mapper, CDS.Model.Definitions.Entities.Contact, contact, fields, showEmptyFields);
+
+            dto.Attributes.ForEach(at =>
+            {
+                at.WithDiscovery = withDiscovery;
+                at.Url = CreateDiscoveryLink("ContactAttribute", new { id = at.Id, tenantName = tenantName, withDiscovery = true, withOptions = true });
+            });
+
+            return ReturnGetRequest(dto);
+        }
+
+        /// <summary>
+        /// Get a single Contact by email or a visitor key
+        /// </summary>
+        /// <param name="tenantName">Name of the tenant.</param>
+        /// <param name="email">The email.</param>
+        /// <param name="visitorkey">The visitorkey.</param>
+        /// <param name="fields">The fields.</param>
+        /// <param name="withDiscovery">if set to <c>true</c> [with discovery].</param>
+        /// <param name="showEmptyFields">if set to <c>true</c> [show empty fields].</param>
+        /// <returns></returns>
+        [Route("", Name = "ContactByEmailOrVisitor")]
+        [HttpGet]
+        [SwaggerResponse(HttpStatusCode.OK, "A full contact model", typeof(ContactDto))]
+        [SwaggerResponse(HttpStatusCode.NotFound, "The contact was not found in our DB", typeof(ResponseMessageResult))]
+        public async Task<IHttpActionResult> GetContactByEmailOrVisitor(string tenantName, string email = null, string visitorkey = null, [FromUri] string[] fields = null, bool withDiscovery = true, bool showEmptyFields = false)
+        {
+            if (email.IsEmpty() && visitorkey.IsEmpty())
+            {
+                return ToErrorResult(new ServiceResponse<ContactDto> { Status = ResponseStatus.NotFound, Reason = MassagesEngine.Errors(ErrorMessages.ValidationError_NoSearchTerm) });
+            }
+
+            var contactUnit = new ContactUnit(AuthUser);
+
+            if (fields != null && fields.Length > 0)
+            {
+                showEmptyFields = true;
+            }
+            try
+            {
+                var contact = email.IsNotEmpty() ? contactUnit.GetFullContactByEmail(email, fields?.ToList()) : contactUnit.GetByVisitorkey(visitorkey, fields?.ToList());
+
+                if (contact != null)
+                {
+                    var dto = await MapToDto(_mapper, CDS.Model.Definitions.Entities.Contact, contact, fields, showEmptyFields);
+                    return Ok(new ServiceResponse<ContactDto> { Status = ResponseStatus.Ok, Result = dto });
+                }
+
+                return IsZapierRequest() ? Ok(new ContactDto[] { }) : NotFound(Definitions.Entities.Contact.ToString());
+
+            }
+            catch (Exception ex)
+            {
+                var errorResult = new ServiceResponse<ContactDto> { Status = ResponseStatus.InternalServerError, Reason = ex.Message };
+                return IsZapierRequest() ? Ok(new ContactDto[] { }) : ToErrorResult(errorResult);
+            }
+        }
+
+        private bool IsZapierRequest()
+        {
+            return Request.Headers.UserAgent.Contains(new ProductInfoHeaderValue(new ProductHeaderValue("Zapier")));
+        }
+
+        /// <summary>
+        ///  Create a new Contact
+        /// </summary>
+        /// <param name="tenantName">The name of the tenant</param>
+        /// <param name="contact">The contact data</param>
+        /// <returns></returns>
+        [Route("", Name = "CreateContact")]
+        [HttpPost]
+        [SwaggerResponse(HttpStatusCode.Created, "A new contact was created using the given information [ see the supplied URL for more data ]", typeof(CreatedReturnMessage))]
+        [SwaggerResponse(HttpStatusCode.NotFound, "The contact was not found in our DB", typeof(ResponseMessageResult))]
+        public async Task<IHttpActionResult> Post(string tenantName, [FromBody] ContactDto contact)
+        {
+            try
+            {
+                contact.Id = 0;
+
+                var uploadImageResult = await UploadImage(_imageValidator, contact);
+                if (uploadImageResult.Status != ResponseStatus.Ok)
+                {
+                    return ToErrorResult(uploadImageResult);
+                }
+                var contactModel = _mapper.ToModel(contact, AuthUser, false);
+                var result = new ContactUnit(AuthUser).Create(contactModel, Contact.eCreateType.Api);
+                var url = CreateDiscoveryLink(DiscoveryLinkName, new { tenantName, id = result });
+                return Created(url,
+                    new ServiceResponse<int> { Status = ResponseStatus.Ok, Result = result, ImageUrl = contact.ImageUrl });
+            }
+            catch (ValidationException e)
+            {
+                return BadRequest(string.Join(",", e.ErrorMessages));
+            }
+            catch (Exception e)
+            {
+                throw new InternalServerErrorException("Error while trying to create a contact " + e.Message,
+                    User.UserId, User.TenantId);
+            }
+        }
+
+        /// <summary>
+        /// Delete A single Contact
+        /// </summary>
+        /// <param name="tenantName">Tenant Name from the Routing parameter</param>
+        /// <param name="id">Contact ID</param>
+        /// <param name="isPermanent">if TRUE the contact will be removed from the sql, if FALSE the contact will be moved to recycle bin</param>
+        /// <returns></returns>
+        [Route("{id}", Name = "DeleteContact")]
+        [HttpDelete]
+        [SwaggerResponse(HttpStatusCode.NoContent, "A contact was removed")]
+        public IHttpActionResult Delete(string tenantName, int id, bool isPermanent = false)
+        {
+            var deleteType = isPermanent ? CDS.Model.Definitions.EntityDeleteType.Physical : CDS.Model.Definitions.EntityDeleteType.Logical;
+            new CustomEntityUnit(AuthUser, (int)CDS.Model.Definitions.Entities.Contact).DeleteEntityRecords(id.ToSingleMemberList(), deleteType);
+            return StatusCode(HttpStatusCode.NoContent);
+        }
+
+        /// <summary>
+        /// Update an Existing Contact
+        /// </summary>
+        /// <param name="tenantName">Tenant Name from the Routing parameter</param>
+        /// <param name="id">Contact ID</param>
+        /// <param name="contact">Contact data</param>
+        /// <returns></returns>
+        [Route("{id}", Name = "UpdateContact")]
+        [HttpPut]
+        [SwaggerResponse(HttpStatusCode.Created, "A contact was updated [ see the supplied URL for more data ]", typeof(CreatedReturnMessage))]
+        [SwaggerResponse(HttpStatusCode.BadRequest, "Error in data validation or storage", typeof(string))]
+        public async Task<IHttpActionResult> Put([FromUri] string tenantName, int id, [FromBody] ContactDto contact)
+        {
+            try
+            {
+                contact.Id = id;
+                var uploadImageResult = await UploadImage(_imageValidator, contact);
+                if (uploadImageResult.Status != ResponseStatus.Ok)
+                {
+                    return ToErrorResult(uploadImageResult);
+                }
+                var contactModel = _mapper.ToModel(contact, AuthUser, true);
+                new ContactUnit(AuthUser).Update(contactModel);
+                var url = CreateDiscoveryLink(DiscoveryLinkName, new { tenantName, id = id });
+                return Created(url, new ServiceResponse<int> { Status = ResponseStatus.Ok, Result = id });
+            }
+            catch (ValidationException e)
+            {
+                return BadRequest(string.Join(",", e.ErrorMessages));
+            }
+            catch (Exception e)
+            {
+                throw new InternalServerErrorException("Error while trying to create a contact " + e.Message, User.UserId, User.TenantId);
+            }
+        }
+
+        /// <summary>
+        /// Get user privileges for specific record
+        /// </summary>
+        /// <param name="tenantName">Name of the tenant.</param>
+        /// <param name="id">Contact ID</param>
+        /// <param name="additionalEntities">Additional entities that their privileges will be added to result</param>
+        /// <returns></returns>
+        //[Route("UserPrivilages/{id}", Name = "ContactUserPrivilages")]
+        //[HttpGet]
+        //public async Task<IHttpActionResult> GetUserPrivilagesForRecord(string tenantName, int id, [FromUri] string[] additionalEntities = null)
+        //{
+        //    return await GenericGetPrivilegesForRecord(_contactService, id, additionalEntities);
+        //}
+
+        #region Contacts Lookup
+
+        /// <summary>
+        /// Gets the contacts with email by term.
+        /// </summary>
+        /// <param name="term">The term.</param>
+        /// <param name="page">The page.</param>
+        /// <param name="pageSize">Size of the page.</param>
+        /// <returns></returns>
+        [Route("TestEmailContactsByTerm")]
+        [HttpGet]
+        public IHttpActionResult GetContactsWithEmailByTerm(string term, int page, int pageSize)
+        {
+            var contactUnit= new ContactUnit(AuthUser);
+            return ReturnGetRequest(contactUnit.GetContactsWithEmailByTerm(AuthUser, term, page, pageSize));
+        }
+
+        /// <summary>
+        /// Gets the contacts by emails.
+        /// </summary>
+        /// <param name="emails">The emails.</param>
+        /// <returns></returns>
+        [Route("TestEmailContactsByEmails")]
+        [HttpPost]
+        public  IHttpActionResult GetContactsByEmails(List<string> emails)
+        {
+            var contactUnit = new ContactUnit(AuthUser);
+            return Content(HttpStatusCode.OK, contactUnit.GetContactsByEmails(AuthUser, emails));
+        }
+
+        #endregion Contacts Lookup
+
+        #region Get all
+        protected string GetOrderByExpression()
+        {
+            var xElement = new XElement("OrderByClause");
+            var element = new XElement("element");
+            element.Add(new XAttribute("attributeid", 1));
+            element.Add(new XAttribute("attributesurroundingid", 0));
+            element.Add(new XAttribute("directionid", 2));
+            xElement.Add(element);
+
+            return xElement.ToString();
+        }
+
+        protected string GetWhereExpression() => null;
+
+        #endregion
+    }
+}
